@@ -1,282 +1,416 @@
 package com.example.ridiextractor
 
 import android.content.Context
-import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.WorkerThread
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.ExperimentalAnimationApi
-import androidx.compose.foundation.*
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.example.ridiextractor.ui.theme.RidiExtractorTheme
-import org.zeroturnaround.zip.ZipUtil
 import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Ask for permission to read and write to external storage
-        val requestPermissionLauncher = registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) {
-            if (it) {
-                // Permission granted
-                setContent {
-                    MainInterface(this)
-                }
-            } else {
-                // Permission denied
-                Toast.makeText(this, "Permission denied", Toast.LENGTH_SHORT).show()
-                // Close the app
-                finish()
+        setContent {
+            RidiExtractorTheme {
+                MainInterface()
             }
         }
-        requestPermissionLauncher.launch(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
     }
 }
 
-data class Book(val id:String,val name: String,val checked: MutableState<Boolean>)
+fun getFileName(context: Context, uri: Uri): String {
+    var name = ""
+    val cursor = context.contentResolver.query(uri, null, null, null, null)
+    cursor?.use {
+        if (it.moveToFirst()) {
+            val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            if (nameIndex != -1) {
+                name = it.getString(nameIndex)
+            }
+        }
+    }
+    if (name.isEmpty()) {
+        name = uri.lastPathSegment ?: "unknown_file"
+    }
+    return name
+}
 
-@OptIn(ExperimentalAnimationApi::class)
+fun copyUriToFile(context: Context, uri: Uri, destFile: File) {
+    context.contentResolver.openInputStream(uri)?.use { input ->
+        FileOutputStream(destFile).use { output ->
+            input.copyTo(output)
+        }
+    }
+}
+
 @Composable
-fun MainInterface(context: Context?) {
-    RidiExtractorTheme {
-        Column {
-            val selected = remember { mutableStateListOf<Book>() }
-            // Title bar
-            Surface(color = MaterialTheme.colors.primary, modifier = Modifier.fillMaxWidth()) {
-                Row {
-                    Text(
-                        text = "RidiExtractor",
-                        modifier = Modifier.padding(10.dp),
-                        style = MaterialTheme.typography.h6
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    // Create a dialog to fill in save path
-                    val openDialog = remember { mutableStateOf(false) }
-                    val appDirectory = File(Environment.getExternalStorageDirectory().absolutePath + "/RidiExtractor")
-                    val storageDirectory = remember { mutableStateOf(appDirectory.absolutePath) }
-                    if (!appDirectory.exists()) {
-                        appDirectory.mkdir()
-                    } else {
-                        val settingFile = File("$appDirectory/settings.txt")
-                        try {
-                            storageDirectory.value = settingFile.readText()
+fun MainInterface() {
+    val context = LocalContext.current
+
+    var zipUri by remember { mutableStateOf<Uri?>(null) }
+    var zipFileName by remember { mutableStateOf("") }
+    var prefUri by remember { mutableStateOf<Uri?>(null) }
+    var prefFileName by remember { mutableStateOf("") }
+    var datUri by remember { mutableStateOf<Uri?>(null) }
+    var datFileName by remember { mutableStateOf("") }
+
+    var bookMetadata by remember { mutableStateOf<BookMetadata?>(null) }
+    var parsedUuid by remember { mutableStateOf<String?>(null) }
+    var isProcessing by remember { mutableStateOf(false) }
+    var processStatus by remember { mutableStateOf("") }
+    var resultDialogMessage by remember { mutableStateOf<String?>(null) }
+
+    val zipPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            zipUri = uri
+            zipFileName = getFileName(context, uri)
+            // Inspect zip for metadata & cover asynchronously
+            Thread {
+                try {
+                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                        val meta = BookExtractor.inspectZip(stream)
+                        Handler(Looper.getMainLooper()).post {
+                            bookMetadata = meta
                         }
-                        catch (e:Exception) { }
                     }
-                    if (openDialog.value) {
-                        AlertDialog(
-                            onDismissRequest = { openDialog.value = false },
-                            title = { Text("Extract Books") },
-                            text = {
-                                Column {
-                                    TextField(
-                                        value = storageDirectory.value,
-                                        onValueChange = { storageDirectory.value = it },
-                                        label = { Text("Storage Directory") }
-                                    )
-                                }
-                            },
-                            confirmButton = {
-                                Button(onClick = {
-                                    // Make sure the directory exists
-                                    val directory = File(storageDirectory.value)
-                                    if(!directory.exists())
-                                        directory.mkdir()
-                                    // Save settings
-                                    val settingFile = File("$appDirectory/settings.txt")
-                                    try {
-                                        settingFile.writeText(storageDirectory.value)
-                                    }
-                                    catch (e:Exception) { }
-                                    // Extract books in a new thread
-                                    val books = selected.toList()
-                                    Thread {
-                                        extractBooks(books, directory, context)
-                                    }.start()
-                                    // Close the dialog
-                                    for (book in selected)
-                                        book.checked.value = false
-                                    selected.clear()
-                                    openDialog.value = false
-                                }) {
-                                    Text("OK")
-                                }
+                } catch (e: Exception) {
+                    Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(context, "Failed to read ZIP: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }.start()
+        }
+    }
+
+    val prefPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            prefUri = uri
+            prefFileName = getFileName(context, uri)
+            try {
+                val xmlText = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() } ?: ""
+                val uuid = BookExtractor.extractUuidFromPreferences(xmlText)
+                parsedUuid = uuid
+                if (uuid == null) {
+                    Toast.makeText(context, "UUID not found in selected preferences XML", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, "Error reading preferences: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val datPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            datUri = uri
+            datFileName = getFileName(context, uri)
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Ridi Extractor") },
+                backgroundColor = MaterialTheme.colors.primary,
+                contentColor = MaterialTheme.colors.onPrimary
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                text = "Unggah file-file berikut untuk mendekripsi buku:",
+                style = MaterialTheme.typography.subtitle1,
+                fontWeight = FontWeight.SemiBold
+            )
+
+            // Step 1: Zip file
+            FileUploadCard(
+                title = "1. ZIP folder extracted",
+                description = "File ZIP berisi extracted/ (OEBPS/Text, Images/cover.jpg, content.opf)",
+                selectedFileName = zipFileName,
+                isCompleted = zipUri != null,
+                buttonText = if (zipUri == null) "Pilih ZIP" else "Ganti ZIP",
+                onSelectClick = {
+                    zipPickerLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream", "*/*"))
+                }
+            )
+
+            // Step 2: Preferences XML
+            FileUploadCard(
+                title = "2. com.initialcoms.ridi_preferences.xml",
+                description = if (parsedUuid != null) "UUID ditemukan: $parsedUuid" else "File shared_prefs untuk mengekstrak Device UUID",
+                selectedFileName = prefFileName,
+                isCompleted = prefUri != null && parsedUuid != null,
+                buttonText = if (prefUri == null) "Pilih XML" else "Ganti XML",
+                onSelectClick = {
+                    prefPickerLauncher.launch(arrayOf("text/xml", "application/xml", "text/plain", "*/*"))
+                }
+            )
+
+            // Step 3: DAT file
+            FileUploadCard(
+                title = "3. {bookid}.dat",
+                description = "File kunci enkripsi buku dari Ridibooks",
+                selectedFileName = datFileName,
+                isCompleted = datUri != null,
+                buttonText = if (datUri == null) "Pilih DAT" else "Ganti DAT",
+                onSelectClick = {
+                    datPickerLauncher.launch(arrayOf("*/*"))
+                }
+            )
+
+            // Preview metadata & cover if available
+            if (bookMetadata != null) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    elevation = 3.dp,
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val coverBytes = bookMetadata?.coverBytes
+                        if (coverBytes != null && coverBytes.isNotEmpty()) {
+                            val bitmap = BitmapFactory.decodeByteArray(coverBytes, 0, coverBytes.size)
+                            if (bitmap != null) {
+                                Image(
+                                    bitmap = bitmap.asImageBitmap(),
+                                    contentDescription = "Cover",
+                                    modifier = Modifier
+                                        .size(70.dp, 100.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
                             }
-                        )
-                    }
-                    // Extract button
-                    AnimatedVisibility(visible = selected.isNotEmpty(), modifier=Modifier.align(Alignment.CenterVertically)) {
-                        Box(modifier = Modifier
-                            .padding(5.dp)
-                            .border(1.dp, MaterialTheme.colors.secondary, RoundedCornerShape(5.dp))
-                            .align(Alignment.CenterVertically)
-                            .clickable {
-                                openDialog.value = true
-                            }) {
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Extract (${selected.size})",
+                                text = bookMetadata?.title ?: "Unknown Title",
                                 style = MaterialTheme.typography.subtitle1,
-                                modifier = Modifier
-                                    .padding(10.dp, 5.dp)
-                                    .align(Alignment.Center)
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = bookMetadata?.author ?: "Unknown Author",
+                                style = MaterialTheme.typography.body2,
+                                color = MaterialTheme.colors.onSurface.copy(alpha = 0.7f)
                             )
                         }
                     }
                 }
             }
-            // Book list
-            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                BookList(selected)
-            }
-        }
-    }
-}
 
-@Composable
-fun BookList(selected: MutableList<Book>) {
-    val ridiDirectory = "${Environment.getDataDirectory()}/data/com.initialcoms.ridi/files"
-    // List all book directories
-    val books = File("$ridiDirectory/books").listFiles()
-    if (books != null) {
-        for (book in books){
-            val bookId = book.name
-            // Find book cover
-            val cover = File("$ridiDirectory/covers/$bookId.png")
-            // Find book info
-            val infoFile = File("$book/extracted/OEBPS/content.opf")
-            if (infoFile.exists()) {
-                val info = infoFile.readText(Charsets.UTF_8)
-                val title = info.substringAfter("<dc:title>").substringBefore("</dc:title>")
-                val author = info.substringAfter("<dc:creator opf:role=\"aut\">").substringBefore("</dc:creator>")
-                BookItem(bookId, cover, title, author, selected)
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalAnimationApi::class)
-@Composable
-fun BookItem(id: String, cover: File, title: String, author: String, selected: MutableList<Book>) {
-    val checked = remember { mutableStateOf(false) }
-    Row(modifier = Modifier
-        .fillMaxWidth()
-        .padding(5.dp)
-        .heightIn(max = 100.dp)
-        .clickable {
-            checked.value = !checked.value
-            if (checked.value) {
-                selected.add(Book(id, title, checked))
-            } else {
-                selected.remove(Book(id, title, checked))
-            }
-        }) {
-        // Check box
-        AnimatedVisibility(
-            visible = checked.value,
-            modifier = Modifier
-                .align(Alignment.CenterVertically),
-        ) {
-            Checkbox(
-                checked = checked.value,
-                onCheckedChange = { },
-                modifier = Modifier
-                    .align(Alignment.CenterVertically)
-                    .padding(5.dp)
-            )
-        }
-        Spacer(modifier = Modifier.width(5.dp))
-        // Book cover
-        Image(
-            bitmap = BitmapFactory.decodeFile(cover.absolutePath)?.asImageBitmap() ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).asImageBitmap(),
-            contentDescription = "Book cover",
-            modifier = Modifier
-                .clip(RoundedCornerShape(5.dp))
-                .size(70.dp, 100.dp)
-        )
-        Spacer(modifier = Modifier.width(10.dp))
-        // Book info
-        Column(modifier = Modifier.weight(1f)) {
-            Text(text = title, style = MaterialTheme.typography.subtitle1, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.weight(1f))
-            Text(text = author, style = MaterialTheme.typography.body1, color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f))
-        }
-    }
-    Divider()
-}
-
-@WorkerThread
-fun extractBooks(books: List<Book>, directory: File, context: Context?) {
-    val ridiDirectory = "${Environment.getDataDirectory()}/data/com.initialcoms.ridi"
-    // Find device id
-    val deviceId: String
-    try {
-        val ridiPreferences = File("$ridiDirectory/shared_prefs/com.initialcoms.ridi_preferences.xml").readText()
-        deviceId = ridiPreferences.substringAfter("<string name=\"uuid\">").substringBefore("</string>")
-    }
-    catch (e: Exception) {
-        Handler(Looper.getMainLooper()).post {
-            Toast.makeText(context, "Failed to find device id", Toast.LENGTH_LONG).show()
-        }
-        return
-    }
-    // Extract books
-    for((index, book) in books.withIndex()) {
-        try {
-            // Copy book directory
-            val bookDirectory = File("$ridiDirectory/files/books/${book.id}")
-            val contentDirectory = File("$bookDirectory/extracted")
-            val targetDirectory = File("$directory/${book.id}")
-            if (targetDirectory.exists())
-                targetDirectory.deleteRecursively()
-            contentDirectory.copyRecursively(targetDirectory, true)
-            // Get key
-            val key = RidiDecrypter.generateKey(deviceId, File("$bookDirectory/${book.id}.dat"))
-            // Decrypt html files
-            val htmlFiles =
-                File("$targetDirectory/OEBPS/Text").listFiles()?.filter { it.extension == "xhtml" || it.extension == "html" || it.extension == "htm" }
-            if (htmlFiles != null) {
-                for (file in htmlFiles) {
-                    var text = RidiDecrypter.decryptHtml(file, key)
-                    text = Regex("([\\s\\S])\\1+$").replace(text, "")
-                    file.writeText(text)
+            // Progress status
+            if (isProcessing) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(text = processStatus, style = MaterialTheme.typography.body2)
                 }
             }
-            // Delete redundant files
-            File("$targetDirectory/OEBPS/Styles/style.css.ridibackup").delete()
-            // Zip the book
-            val zipFile = File("$directory/${book.name}.epub")
-            if (zipFile.exists())
-                zipFile.delete()
-            ZipUtil.pack(targetDirectory, zipFile)
-            // Delete the book directory
-            targetDirectory.deleteRecursively()
-            // Toast message
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(context, "${book.name} extracted (${index + 1}/${books.size})", Toast.LENGTH_SHORT).show()
+
+            // Decrypt Action Button
+            val canDecrypt = zipUri != null && prefUri != null && datUri != null && parsedUuid != null && !isProcessing
+            Button(
+                onClick = {
+                    val currentZipUri = zipUri ?: return@Button
+                    val currentDatUri = datUri ?: return@Button
+                    val uuid = parsedUuid ?: return@Button
+                    val bookTitle = bookMetadata?.title ?: "decrypted_book"
+
+                    isProcessing = true
+                    processStatus = "Memulai dekripsi..."
+
+                    Thread {
+                        val cacheDir = context.cacheDir
+                        val tempZip = File(cacheDir, "input_${System.currentTimeMillis()}.zip")
+                        val tempDat = File(cacheDir, "input_${System.currentTimeMillis()}.dat")
+                        val workDir = File(cacheDir, "work_${System.currentTimeMillis()}")
+
+                        try {
+                            processStatus = "Menyiapkan file..."
+                            copyUriToFile(context, currentZipUri, tempZip)
+                            copyUriToFile(context, currentDatUri, tempDat)
+
+                            // Clean book title for filename
+                            val safeTitle = bookTitle.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+                            val outDir = File(
+                                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                                "RidiExtractor"
+                            )
+                            if (!outDir.exists()) {
+                                outDir.mkdirs()
+                            }
+                            val outputEpub = File(outDir, "$safeTitle.epub")
+
+                            processStatus = "Mendekripsi file XHTML & mengemas ke EPUB..."
+                            val finalMeta = BookExtractor.decryptAndPackage(
+                                zipFile = tempZip,
+                                datFile = tempDat,
+                                deviceId = uuid,
+                                outputEpubFile = outputEpub,
+                                tempWorkDir = workDir
+                            )
+
+                            Handler(Looper.getMainLooper()).post {
+                                isProcessing = false
+                                resultDialogMessage = "Berhasil mendekripsi dan mengemas EPUB:\n\n" +
+                                        "Judul: ${finalMeta.title}\n" +
+                                        "Penulis: ${finalMeta.author}\n\n" +
+                                        "Tersimpan di:\n${outputEpub.absolutePath}"
+                            }
+                        } catch (e: Exception) {
+                            Handler(Looper.getMainLooper()).post {
+                                isProcessing = false
+                                resultDialogMessage = "Gagal mendekripsi buku: ${e.message}"
+                            }
+                        } finally {
+                            tempZip.delete()
+                            tempDat.delete()
+                            workDir.deleteRecursively()
+                        }
+                    }.start()
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp),
+                enabled = canDecrypt,
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Icon(Icons.Filled.PlayArrow, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Dekripsi & Buat EPUB", fontSize = 16.sp, fontWeight = FontWeight.Bold)
             }
         }
-        catch (e: Exception) {
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(context, "Failed to extract ${book.name}", Toast.LENGTH_LONG).show()
+    }
+
+    resultDialogMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { resultDialogMessage = null },
+            title = { Text("Informasi Dekripsi") },
+            text = { Text(msg) },
+            confirmButton = {
+                Button(onClick = { resultDialogMessage = null }) {
+                    Text("OK")
+                }
+            }
+        )
+    }
+}
+
+@Composable
+fun FileUploadCard(
+    title: String,
+    description: String,
+    selectedFileName: String,
+    isCompleted: Boolean,
+    buttonText: String,
+    onSelectClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = 2.dp,
+        shape = RoundedCornerShape(8.dp),
+        border = if (isCompleted) BorderStroke(1.dp, MaterialTheme.colors.primary) else null
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(14.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.subtitle1,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                if (isCompleted) {
+                    Icon(
+                        imageVector = Icons.Filled.CheckCircle,
+                        contentDescription = "Ready",
+                        tint = MaterialTheme.colors.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = description,
+                style = MaterialTheme.typography.caption,
+                color = MaterialTheme.colors.onSurface.copy(alpha = 0.6f)
+            )
+            if (selectedFileName.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "File: $selectedFileName",
+                    style = MaterialTheme.typography.body2,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colors.primary
+                )
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            OutlinedButton(
+                onClick = onSelectClick,
+                modifier = Modifier.align(Alignment.End),
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text(buttonText)
             }
         }
     }
